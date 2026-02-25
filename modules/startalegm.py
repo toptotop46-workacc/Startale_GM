@@ -156,9 +156,11 @@ def check_smart_account_exists(eoa_address: str) -> bool:
     }
     try:
         r = requests.get(url, headers=headers, proxies=proxies, timeout=15)
+        # 404 = смарт-аккаунт не создан; 200 (любой ответ, в т.ч. с пустым массивом) = создан
+        if r.status_code == 404:
+            return False
         if r.ok:
-            data = r.json()
-            return "smartAccounts" in data
+            return True
         return False
     except Exception as e:
         logger.warning("Проверка profile/mapping не удалась: {}", e)
@@ -430,27 +432,26 @@ class StartaleGMBrowser:
                 page = await context.new_page()
             await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
             logger.success(f"Открыта страница: {PORTAL_URL}")
+            await asyncio.sleep(2)
 
-            # Ждём модальное окно (role="dialog"), затем кнопку "Continue with Startale App" внутри него
-            modal = page.locator('[role="dialog"]')
-            await modal.wait_for(state="visible", timeout=30000)
-            continue_btn = modal.get_by_role("button", name="Continue with Startale App")
-            await continue_btn.wait_for(state="visible", timeout=10000)
-            # Клик открывает новое всплывающее окно (Startale App) — ждём его и переключаемся на него
-            async with context.expect_page() as popup_info:
-                await continue_btn.click()
+            # Основная страница портала: всегда сначала кнопка Connect Wallet; клик открывает popup Startale. На странице несколько кнопок — берём по data-testid.
+            connect_wallet_btn = page.get_by_test_id("connect-wallet-button")
+            await connect_wallet_btn.wait_for(state="visible", timeout=20000)
+            await connect_wallet_btn.scroll_into_view_if_needed()
+            await asyncio.sleep(0.5)
+            async with context.expect_page(timeout=35000) as popup_info:
+                await connect_wallet_btn.click()
             popup_page = await popup_info.value
             await popup_page.wait_for_load_state("domcontentloaded", timeout=30000)
-            logger.success('В модальном окне нажата кнопка "Continue with Startale App", открыто окно Startale App')
+            logger.success('Нажата "Connect Wallet", открыт popup Startale')
 
-            # Во всплывающем окне ждём и нажимаем "Connect a wallet"
+            # В popup Startale: Connect a wallet → Rabby → popup кошелька (Connect, затем закрывается) → новый popup кошелька (Sign/Confirm) → затем Approve в popup Startale.
             connect_btn = popup_page.get_by_role("button", name="Connect a wallet")
             await connect_btn.wait_for(state="visible", timeout=30000)
             await connect_btn.click()
-            logger.success('Во всплывающем окне нажата кнопка "Connect a wallet"')
+            logger.success('В popup нажата кнопка "Connect a wallet"')
             await asyncio.sleep(2)
 
-            # В модальном окне "Log in or sign up" выбираем Rabby (список кошельков)
             rabby_btn = popup_page.get_by_role("button", name="Rabby")
             await rabby_btn.wait_for(state="visible", timeout=30000)
             # Клик по Rabby открывает popup окно расширения кошелька — ждём его
@@ -483,39 +484,36 @@ class StartaleGMBrowser:
             logger.success('Нажата кнопка Confirm в popup кошелька')
             await asyncio.sleep(1)
 
-            # В окне Startale App (где выбирали Rabby) появляется экран "wants to connect" — ждём Approve и кликаем
+            # В popup Startale App после Sign/Confirm в кошельке появляется кнопка Approve
             approve_btn = popup_page.get_by_role("button", name="Approve")
             await approve_btn.wait_for(state="visible", timeout=30000)
             await approve_btn.click()
-            logger.success('Нажата кнопка Approve в окне Startale App')
+            logger.success('В popup нажата кнопка Approve')
             await asyncio.sleep(1)
 
-            # На основной вкладке портала снова ждём "Continue with Startale App", кликаем; если появился popup с Approve — кликаем; иначе повторяем (сайт может глючить)
+            # При необходимости второй Approve: снова основная страница → Connect Wallet → в открывшемся popup Approve
             approved_second_popup = False
-            max_continue_retries = 5
-            for attempt in range(max_continue_retries):
+            max_retries = 5
+            for attempt in range(max_retries):
                 await page.bring_to_front()
-                modal_again = page.locator('[role="dialog"]')
-                await modal_again.wait_for(state="visible", timeout=30000)
-                continue_btn_again = modal_again.get_by_role("button", name="Continue with Startale App")
-                await continue_btn_again.wait_for(state="visible", timeout=10000)
+                connect_again = page.get_by_test_id("connect-wallet-button")
                 try:
+                    await connect_again.wait_for(state="visible", timeout=10000)
                     async with context.expect_page(timeout=10000) as popup_info:
-                        await continue_btn_again.click()
-                    logger.success('На основной вкладке портала нажата кнопка "Continue with Startale App"')
-                    popup_after_continue = await popup_info.value
-                    await popup_after_continue.wait_for_load_state("domcontentloaded", timeout=15000)
-                    approve_btn_2 = popup_after_continue.get_by_role("button", name="Approve")
+                        await connect_again.click()
+                    popup_after = await popup_info.value
+                    await popup_after.wait_for_load_state("domcontentloaded", timeout=15000)
+                    approve_btn_2 = popup_after.get_by_role("button", name="Approve")
                     await approve_btn_2.wait_for(state="visible", timeout=15000)
                     await approve_btn_2.click()
                     logger.success('В новом popup нажата кнопка Approve')
                     approved_second_popup = True
                     break
                 except Exception:
-                    logger.info("Новый popup с кнопкой Approve не появился, повторяем клик Continue with Startale App ({}/{})", attempt + 1, max_continue_retries)
+                    logger.info("Второй Approve не потребовался или кнопка не найдена ({}/{})", attempt + 1, max_retries)
                     await asyncio.sleep(2)
-            else:
-                logger.warning("После {} попыток popup с Approve так и не появился", max_continue_retries)
+            if not approved_second_popup:
+                logger.debug("Повторный клик Connect Wallet / Approve не выполнялся")
 
             # Если был Approve — проверяем API: если в ответе есть поле smartAccounts (даже пустой массив), не делаем Try gasless
             if approved_second_popup:
@@ -524,10 +522,11 @@ class StartaleGMBrowser:
                 need_gasless = True
                 try:
                     response = await page.request.get(mapping_url)
-                    if response.ok:
-                        data = await response.json()
-                        if "smartAccounts" in data:
-                            need_gasless = False
+                    # 404 = смарт-аккаунт не создан (нужен Try gasless); 200 = создан (пропускаем)
+                    if response.status == 404:
+                        need_gasless = True
+                    elif response.ok:
+                        need_gasless = False
                 except Exception as e:
                     logger.warning("Проверка profile/mapping не удалась: {}, выполняем Try gasless", e)
                 if need_gasless:
