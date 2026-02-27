@@ -434,13 +434,13 @@ class StartaleGMBrowser:
             logger.success(f"Открыта страница: {PORTAL_URL}")
             await asyncio.sleep(2)
 
-            # Основная страница портала: всегда сначала кнопка Connect Wallet; клик открывает popup Startale. На странице несколько кнопок — берём по data-testid.
+            # Основная страница портала: кнопка Connect Wallet; клик открывает popup Startale. Кликаем через JS, чтобы сработало даже при перекрытии/задержках.
             connect_wallet_btn = page.get_by_test_id("connect-wallet-button")
             await connect_wallet_btn.wait_for(state="visible", timeout=20000)
             await connect_wallet_btn.scroll_into_view_if_needed()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
             async with context.expect_page(timeout=35000) as popup_info:
-                await connect_wallet_btn.click()
+                await connect_wallet_btn.evaluate("el => el.click()")
             popup_page = await popup_info.value
             await popup_page.wait_for_load_state("domcontentloaded", timeout=30000)
             logger.success('Нажата "Connect Wallet", открыт popup Startale')
@@ -491,65 +491,41 @@ class StartaleGMBrowser:
             logger.success('В popup нажата кнопка Approve')
             await asyncio.sleep(1)
 
-            # При необходимости второй Approve: снова основная страница → Connect Wallet → в открывшемся popup Approve
-            approved_second_popup = False
-            max_retries = 5
-            for attempt in range(max_retries):
-                await page.bring_to_front()
-                connect_again = page.get_by_test_id("connect-wallet-button")
-                try:
-                    await connect_again.wait_for(state="visible", timeout=10000)
-                    async with context.expect_page(timeout=10000) as popup_info:
-                        await connect_again.click()
-                    popup_after = await popup_info.value
-                    await popup_after.wait_for_load_state("domcontentloaded", timeout=15000)
-                    approve_btn_2 = popup_after.get_by_role("button", name="Approve")
-                    await approve_btn_2.wait_for(state="visible", timeout=15000)
-                    await approve_btn_2.click()
-                    logger.success('В новом popup нажата кнопка Approve')
-                    approved_second_popup = True
-                    break
-                except Exception:
-                    logger.info("Второй Approve не потребовался или кнопка не найдена ({}/{})", attempt + 1, max_retries)
-                    await asyncio.sleep(2)
-            if not approved_second_popup:
-                logger.debug("Повторный клик Connect Wallet / Approve не выполнялся")
-
-            # Если был Approve — проверяем API: если в ответе есть поле smartAccounts (даже пустой массив), не делаем Try gasless
-            if approved_second_popup:
-                await page.bring_to_front()
-                mapping_url = f"{PROFILE_MAPPING_URL}?eoaAddress={eoa_address}"
-                need_gasless = True
-                try:
-                    response = await page.request.get(mapping_url)
-                    # 404 = смарт-аккаунт не создан (нужен Try gasless); 200 = создан (пропускаем)
-                    if response.status == 404:
-                        need_gasless = True
-                    elif response.ok:
-                        need_gasless = False
-                except Exception as e:
-                    logger.warning("Проверка profile/mapping не удалась: {}, выполняем Try gasless", e)
-                if need_gasless:
-                    logger.info("В ответе API нет smartAccounts, выполняем Try gasless action и Send")
-                    await page.reload(wait_until="domcontentloaded", timeout=60000)
-                    welcome_modal = page.locator('[role="dialog"][aria-labelledby="welcome-back-modal-title"]')
-                    await welcome_modal.wait_for(state="visible", timeout=30000)
-                    try_gasless_btn = page.get_by_role("button", name="Try gasless action")
-                    await try_gasless_btn.wait_for(state="visible", timeout=10000)
-                    async with context.expect_page(timeout=15000) as tx_popup_info:
-                        await try_gasless_btn.click()
-                    logger.success('Нажата кнопка "Try gasless action" в модальном окне Welcome back')
-                    tx_popup = await tx_popup_info.value
-                    await tx_popup.wait_for_load_state("domcontentloaded", timeout=15000)
-                    logger.info("Открыт popup подтверждения транзакции, ждём активную кнопку Send")
-                    send_btn = tx_popup.get_by_role("button", name="Send")
-                    await send_btn.wait_for(state="visible", timeout=30000)
-                    await send_btn.click(timeout=60000)
-                    logger.success('Нажата кнопка Send в popup подтверждения транзакции')
-                    await page.goto(STARTALE_APP_URL, wait_until="domcontentloaded", timeout=60000)
-                    logger.success("Открыта страница {}", STARTALE_APP_URL)
+            # Создание смарт-аккаунта: проверяем mapping (404 = не создан). Если не создан — на основной странице портала жмём "Try gasless action", в открывшемся popup Startale — Approve.
+            await page.bring_to_front()
+            mapping_url = f"{PROFILE_MAPPING_URL}?eoaAddress={eoa_address}"
+            need_gasless = True
+            try:
+                response = await page.request.get(mapping_url)
+                if response.status == 404:
+                    need_gasless = True
+                elif response.ok:
+                    need_gasless = False
+            except Exception as e:
+                logger.warning("Проверка profile/mapping не удалась: {}, выполняем Try gasless", e)
+            if need_gasless:
+                logger.info("Смарт-аккаунт не создан, нажимаем Try gasless action на портале")
+                if "portal.soneium.org" not in page.url:
+                    await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
                 else:
-                    logger.info("В ответе API есть smartAccounts, пропускаем Try gasless action")
+                    await page.reload(wait_until="domcontentloaded", timeout=60000)
+                welcome_modal = page.locator('[role="dialog"][aria-labelledby="welcome-back-modal-title"]')
+                await welcome_modal.wait_for(state="visible", timeout=30000)
+                try_gasless_btn = page.get_by_role("button", name="Try gasless action")
+                await try_gasless_btn.wait_for(state="visible", timeout=10000)
+                async with context.expect_page(timeout=15000) as startale_popup_info:
+                    await try_gasless_btn.click()
+                logger.success('Нажата кнопка "Try gasless action" на основной странице портала')
+                startale_popup = await startale_popup_info.value
+                await startale_popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                approve_gasless = startale_popup.get_by_role("button", name="Approve")
+                await approve_gasless.wait_for(state="visible", timeout=30000)
+                await approve_gasless.click()
+                logger.success('В popup Startale нажата кнопка Approve (подпись gasless-транзакции)')
+                await page.goto(STARTALE_APP_URL, wait_until="domcontentloaded", timeout=60000)
+                logger.success("Открыта страница {}", STARTALE_APP_URL)
+            else:
+                logger.info("Смарт-аккаунт уже создан (mapping 200), пропускаем Try gasless action")
             await asyncio.sleep(1)
 
             # Если не на app.startale.com (например, пропустили Try gasless), переходим туда и выполняем GM
@@ -576,7 +552,7 @@ class StartaleGMBrowser:
                         await send_gm_btn.wait_for(state="visible", timeout=15000)
                         await send_gm_btn.click(timeout=10000)
                         logger.success('Нажата кнопка "Send GM back"')
-                        await page.locator("h2:has-text('GM sent!')").wait_for(state="visible", timeout=30000)
+                        await page.locator("h2:has-text('GM sent!')").wait_for(state="visible", timeout=120000)
                         logger.success('Появилось модальное окно "GM sent!"')
                         try:
                             text = await _get_next_gm_text_from_modal(page)
@@ -682,7 +658,7 @@ class StartaleGMBrowser:
                     await send_gm_btn.wait_for(state="visible", timeout=15000)
                     await send_gm_btn.click(timeout=10000)
                     logger.success('Нажата кнопка "Send GM back"')
-                    await page.locator("h2:has-text('GM sent!')").wait_for(state="visible", timeout=30000)
+                    await page.locator("h2:has-text('GM sent!')").wait_for(state="visible", timeout=120000)
                     logger.success('Появилось модальное окно "GM sent!"')
                     try:
                         text = await _get_next_gm_text_from_modal(page)
@@ -836,9 +812,9 @@ def run_monitor(manager: StartaleGMBrowser, all_keys: list[str]) -> None:
         except Exception as e:
             err_msg = str(e)
             if current_addr and ("Exceeding import daily limit" in err_msg or "recovery after" in err_msg.lower()):
-                fallback_at = datetime.now(timezone.utc) + timedelta(hours=10)
-                db.upsert_account(current_addr, next_gm_available_at=fallback_at)
-                logger.warning("Лимит AdsPower (создание профилей). Аккаунт {} отложен на 10 ч.", current_addr)
+                # При лимите AdsPower профили просто пропускаем: расписание next_gm_available_at не трогаем,
+                # чтобы его не смещать искусственно на 10 часов.
+                logger.warning("Лимит AdsPower (создание профилей). Аккаунт {} пропущен.", current_addr)
             else:
                 logger.error("Ошибка мониторинга: {}", err_msg)
             time.sleep(MONITOR_INTERVAL_SEC)
